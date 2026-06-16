@@ -38,6 +38,30 @@ func (e AccessRestrictionsCrowdsecMode) Valid() bool {
 	}
 }
 
+// Defines values for AutoConfigureRequestProvider.
+const (
+	AutoConfigureRequestProviderCloudflare   AutoConfigureRequestProvider = "cloudflare"
+	AutoConfigureRequestProviderDigitalocean AutoConfigureRequestProvider = "digitalocean"
+	AutoConfigureRequestProviderRfc2136      AutoConfigureRequestProvider = "rfc2136"
+	AutoConfigureRequestProviderRoute53      AutoConfigureRequestProvider = "route53"
+)
+
+// Valid indicates whether the value is a known member of the AutoConfigureRequestProvider enum.
+func (e AutoConfigureRequestProvider) Valid() bool {
+	switch e {
+	case AutoConfigureRequestProviderCloudflare:
+		return true
+	case AutoConfigureRequestProviderDigitalocean:
+		return true
+	case AutoConfigureRequestProviderRfc2136:
+		return true
+	case AutoConfigureRequestProviderRoute53:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for CreateAzureIntegrationRequestHost.
 const (
 	CreateAzureIntegrationRequestHostMicrosoftCom CreateAzureIntegrationRequestHost = "microsoft.com"
@@ -938,6 +962,51 @@ func (e SentinelOneMatchAttributesNetworkStatus) Valid() bool {
 	}
 }
 
+// Defines values for ServiceChallengeType.
+const (
+	ServiceChallengeTypeDns01     ServiceChallengeType = "dns-01"
+	ServiceChallengeTypeHttp01    ServiceChallengeType = "http-01"
+	ServiceChallengeTypeTlsAlpn01 ServiceChallengeType = "tls-alpn-01"
+)
+
+// Valid indicates whether the value is a known member of the ServiceChallengeType enum.
+func (e ServiceChallengeType) Valid() bool {
+	switch e {
+	case ServiceChallengeTypeDns01:
+		return true
+	case ServiceChallengeTypeHttp01:
+		return true
+	case ServiceChallengeTypeTlsAlpn01:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ServiceDnsProvider.
+const (
+	ServiceDnsProviderCloudflare   ServiceDnsProvider = "cloudflare"
+	ServiceDnsProviderDigitalocean ServiceDnsProvider = "digitalocean"
+	ServiceDnsProviderRfc2136      ServiceDnsProvider = "rfc2136"
+	ServiceDnsProviderRoute53      ServiceDnsProvider = "route53"
+)
+
+// Valid indicates whether the value is a known member of the ServiceDnsProvider enum.
+func (e ServiceDnsProvider) Valid() bool {
+	switch e {
+	case ServiceDnsProviderCloudflare:
+		return true
+	case ServiceDnsProviderDigitalocean:
+		return true
+	case ServiceDnsProviderRfc2136:
+		return true
+	case ServiceDnsProviderRoute53:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ServiceMode.
 const (
 	ServiceModeHttp ServiceMode = "http"
@@ -986,6 +1055,51 @@ func (e ServiceMetaStatus) Valid() bool {
 	case ServiceMetaStatusPending:
 		return true
 	case ServiceMetaStatusTunnelNotCreated:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ServiceRequestChallengeType.
+const (
+	ServiceRequestChallengeTypeDns01     ServiceRequestChallengeType = "dns-01"
+	ServiceRequestChallengeTypeHttp01    ServiceRequestChallengeType = "http-01"
+	ServiceRequestChallengeTypeTlsAlpn01 ServiceRequestChallengeType = "tls-alpn-01"
+)
+
+// Valid indicates whether the value is a known member of the ServiceRequestChallengeType enum.
+func (e ServiceRequestChallengeType) Valid() bool {
+	switch e {
+	case ServiceRequestChallengeTypeDns01:
+		return true
+	case ServiceRequestChallengeTypeHttp01:
+		return true
+	case ServiceRequestChallengeTypeTlsAlpn01:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ServiceRequestDnsProvider.
+const (
+	ServiceRequestDnsProviderCloudflare   ServiceRequestDnsProvider = "cloudflare"
+	ServiceRequestDnsProviderDigitalocean ServiceRequestDnsProvider = "digitalocean"
+	ServiceRequestDnsProviderRfc2136      ServiceRequestDnsProvider = "rfc2136"
+	ServiceRequestDnsProviderRoute53      ServiceRequestDnsProvider = "route53"
+)
+
+// Valid indicates whether the value is a known member of the ServiceRequestDnsProvider enum.
+func (e ServiceRequestDnsProvider) Valid() bool {
+	switch e {
+	case ServiceRequestDnsProviderCloudflare:
+		return true
+	case ServiceRequestDnsProviderDigitalocean:
+		return true
+	case ServiceRequestDnsProviderRfc2136:
+		return true
+	case ServiceRequestDnsProviderRoute53:
 		return true
 	default:
 		return false
@@ -1505,6 +1619,20 @@ type AccountSettings struct {
 	RoutingPeerDnsResolutionEnabled *bool `json:"routing_peer_dns_resolution_enabled,omitempty"`
 }
 
+// AutoConfigureRequest Optional. When present, NetBird uses the referenced DNS provider
+// credential to automatically write the wildcard CNAME for this
+// domain. Omit this field to use the default manual-CNAME flow.
+type AutoConfigureRequest struct {
+	// CredentialId Reference to a stored DNS provider credential
+	CredentialId string `json:"credential_id"`
+
+	// Provider DNS provider type. Must match the credential's provider type — the server validates this and rejects mismatches.
+	Provider AutoConfigureRequestProvider `json:"provider"`
+}
+
+// AutoConfigureRequestProvider DNS provider type. Must match the credential's provider type — the server validates this and rejects mismatches.
+type AutoConfigureRequestProvider string
+
 // AvailablePorts defines model for AvailablePorts.
 type AvailablePorts struct {
 	// Tcp Number of available TCP  ports left on the ingress peer
@@ -1789,6 +1917,49 @@ type CreateTenantRequest struct {
 	Name string `json:"name"`
 }
 
+// Credential Credential metadata. The secret value is never included on responses.
+type Credential struct {
+	// CreatedAt Creation timestamp.
+	CreatedAt time.Time `json:"created_at"`
+
+	// Id Opaque server-generated reference for the credential.
+	Id string `json:"id"`
+
+	// Name User-friendly label.
+	Name string `json:"name"`
+
+	// ProviderType Identifier of the consumer.
+	ProviderType string `json:"provider_type"`
+}
+
+// CredentialRequest Credential to store. The plaintext secret(s) are sent in the
+// request body and immediately encrypted at rest in the management
+// database. They are never returned on subsequent reads.
+//
+// Use `secret_fields` for multi-field providers (Route 53, RFC 2136).
+// For single-token providers (Cloudflare, DigitalOcean), either
+// `secret_fields` (preferred) or the legacy `secret` (single string)
+// is accepted. Exactly one of `secret` and `secret_fields` should be
+// set.
+type CredentialRequest struct {
+	// Name User-friendly label.
+	Name string `json:"name"`
+
+	// ProviderType Identifier of the consumer (e.g., "cloudflare", "route53", "digitalocean", "rfc2136").
+	ProviderType string `json:"provider_type"`
+
+	// Secret Legacy single-string secret. Convenient for single-token providers
+	// (Cloudflare, DigitalOcean) where only one value is required.
+	// Internally wrapped as the provider's primary key (e.g.,
+	// "auth_token") at write time.
+	Secret *string `json:"secret,omitempty"`
+
+	// SecretFields Per-field secret values for multi-field providers (Route 53:
+	// access_key_id + secret_access_key + optional region/hosted_zone_id;
+	// RFC 2136: nameserver + tsig_algorithm + tsig_key + tsig_secret).
+	SecretFields *map[string]string `json:"secret_fields,omitempty"`
+}
+
 // DNSChallengeResponse defines model for DNSChallengeResponse.
 type DNSChallengeResponse struct {
 	// DnsChallenge The DNS challenge to set in a TXT record
@@ -1802,6 +1973,10 @@ type DNSRecord struct {
 
 	// Id DNS record ID
 	Id string `json:"id"`
+
+	// ManagedByServiceId ID of the reverse-proxy service that owns this record's lifecycle.
+	// When non-empty, the record is auto-managed and read-only via this API.
+	ManagedByServiceId *string `json:"managed_by_service_id,omitempty"`
 
 	// Name FQDN for the DNS record. Must be a subdomain within or match the zone's domain.
 	Name string `json:"name"`
@@ -3780,6 +3955,15 @@ type ResourceType string
 
 // ReverseProxyDomain defines model for ReverseProxyDomain.
 type ReverseProxyDomain struct {
+	// AutoConfigured Whether NetBird wrote the wildcard CNAME automatically via a stored DNS provider credential. False means the user added the record manually.
+	AutoConfigured *bool `json:"auto_configured,omitempty"`
+
+	// AutoConfiguredCredentialId Reference to the stored credential that was used when auto_configured is true. May refer to a credential that has since been deleted.
+	AutoConfiguredCredentialId *string `json:"auto_configured_credential_id,omitempty"`
+
+	// AutoConfiguredProvider DNS provider type used when auto_configured is true. Denormalized from the credential at write time so it survives credential deletion.
+	AutoConfiguredProvider *string `json:"auto_configured_provider,omitempty"`
+
 	// Domain Domain name
 	Domain string `json:"domain"`
 
@@ -3807,6 +3991,11 @@ type ReverseProxyDomain struct {
 
 // ReverseProxyDomainRequest defines model for ReverseProxyDomainRequest.
 type ReverseProxyDomainRequest struct {
+	// AutoConfigure Optional. When present, NetBird uses the referenced DNS provider
+	// credential to automatically write the wildcard CNAME for this
+	// domain. Omit this field to use the default manual-CNAME flow.
+	AutoConfigure *AutoConfigureRequest `json:"auto_configure,omitempty"`
+
 	// Domain Domain name
 	Domain string `json:"domain"`
 
@@ -3988,6 +4177,15 @@ type Service struct {
 	AccessRestrictions *AccessRestrictions `json:"access_restrictions,omitempty"`
 	Auth               ServiceAuthConfig   `json:"auth"`
 
+	// ChallengeType ACME challenge type for cert issuance. Empty means use the proxy's globally-configured default.
+	ChallengeType *ServiceChallengeType `json:"challenge_type,omitempty"`
+
+	// DnsCredentialsRef Opaque reference to the encrypted credential record for dns-01 issuance.
+	DnsCredentialsRef *string `json:"dns_credentials_ref,omitempty"`
+
+	// DnsProvider DNS provider for dns-01 issuance. Required when challenge_type is "dns-01"; must be empty otherwise.
+	DnsProvider *ServiceDnsProvider `json:"dns_provider,omitempty"`
+
 	// Domain Domain for the service
 	Domain string `json:"domain"`
 
@@ -4013,6 +4211,9 @@ type Service struct {
 	// PortAutoAssigned Whether the listen port was auto-assigned
 	PortAutoAssigned *bool `json:"port_auto_assigned,omitempty"`
 
+	// Private When true, the service is local-only, reachable only from inside the NetBird mesh. The management server auto-creates an internal DNS record and the proxy listener rejects non-mesh connections.
+	Private *bool `json:"private,omitempty"`
+
 	// ProxyCluster The proxy cluster handling this service (derived from domain)
 	ProxyCluster *string `json:"proxy_cluster,omitempty"`
 
@@ -4025,6 +4226,12 @@ type Service struct {
 	// Terminated Whether the service has been terminated. Terminated services cannot be updated. Services that violate the Terms of Service will be terminated.
 	Terminated *bool `json:"terminated,omitempty"`
 }
+
+// ServiceChallengeType ACME challenge type for cert issuance. Empty means use the proxy's globally-configured default.
+type ServiceChallengeType string
+
+// ServiceDnsProvider DNS provider for dns-01 issuance. Required when challenge_type is "dns-01"; must be empty otherwise.
+type ServiceDnsProvider string
 
 // ServiceMode Service mode. "http" for L7 reverse proxy, "tcp"/"udp"/"tls" for L4 passthrough.
 type ServiceMode string
@@ -4059,6 +4266,15 @@ type ServiceRequest struct {
 	AccessRestrictions *AccessRestrictions `json:"access_restrictions,omitempty"`
 	Auth               *ServiceAuthConfig  `json:"auth,omitempty"`
 
+	// ChallengeType ACME challenge type for cert issuance. Empty means use the proxy's globally-configured default.
+	ChallengeType *ServiceRequestChallengeType `json:"challenge_type,omitempty"`
+
+	// DnsCredentialsRef Opaque reference to the encrypted credential record for dns-01 issuance.
+	DnsCredentialsRef *string `json:"dns_credentials_ref,omitempty"`
+
+	// DnsProvider DNS provider for dns-01 issuance. Required when challenge_type is "dns-01"; must be empty otherwise.
+	DnsProvider *ServiceRequestDnsProvider `json:"dns_provider,omitempty"`
+
 	// Domain Domain for the service
 	Domain string `json:"domain"`
 
@@ -4077,12 +4293,21 @@ type ServiceRequest struct {
 	// PassHostHeader When true, the original client Host header is passed through to the backend instead of being rewritten to the backend's address
 	PassHostHeader *bool `json:"pass_host_header,omitempty"`
 
+	// Private When true, the service is local-only. Requires challenge_type "dns-01".
+	Private *bool `json:"private,omitempty"`
+
 	// RewriteRedirects When true, Location headers in backend responses are rewritten to replace the backend address with the public-facing domain
 	RewriteRedirects *bool `json:"rewrite_redirects,omitempty"`
 
 	// Targets List of target backends for this service
 	Targets *[]ServiceTarget `json:"targets,omitempty"`
 }
+
+// ServiceRequestChallengeType ACME challenge type for cert issuance. Empty means use the proxy's globally-configured default.
+type ServiceRequestChallengeType string
+
+// ServiceRequestDnsProvider DNS provider for dns-01 issuance. Required when challenge_type is "dns-01"; must be empty otherwise.
+type ServiceRequestDnsProvider string
 
 // ServiceRequestMode Service mode. "http" for L7 reverse proxy, "tcp"/"udp"/"tls" for L4 passthrough.
 type ServiceRequestMode string
@@ -4749,6 +4974,12 @@ type ZoneRequest struct {
 // Conflict Standard error response. Note: The exact structure of this error response is inferred from `util.WriteErrorResponse` and `util.WriteError` usage in the provided Go code, as a specific Go struct for errors was not provided.
 type Conflict = ErrorResponse
 
+// GetApiCredentialsParams defines parameters for GetApiCredentials.
+type GetApiCredentialsParams struct {
+	// ProviderType Filter by provider_type (exact match).
+	ProviderType *string `form:"provider_type,omitempty" json:"provider_type,omitempty"`
+}
+
 // GetApiEventsNetworkTrafficParams defines parameters for GetApiEventsNetworkTraffic.
 type GetApiEventsNetworkTrafficParams struct {
 	// Page Page number
@@ -4946,6 +5177,12 @@ type GetApiUsersParams struct {
 
 // PutApiAccountsAccountIdJSONRequestBody defines body for PutApiAccountsAccountId for application/json ContentType.
 type PutApiAccountsAccountIdJSONRequestBody = AccountRequest
+
+// CreateCredentialJSONRequestBody defines body for CreateCredential for application/json ContentType.
+type CreateCredentialJSONRequestBody = CredentialRequest
+
+// UpdateCredentialJSONRequestBody defines body for UpdateCredential for application/json ContentType.
+type UpdateCredentialJSONRequestBody = CredentialRequest
 
 // PostApiDnsNameserversJSONRequestBody defines body for PostApiDnsNameservers for application/json ContentType.
 type PostApiDnsNameserversJSONRequestBody = NameserverGroupRequest

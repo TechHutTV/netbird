@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/proxy"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/service"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/sessionkey"
+	recordsmgr "github.com/netbirdio/netbird/management/internals/modules/zones/records/manager"
 	"github.com/netbirdio/netbird/management/server/account"
 	"github.com/netbirdio/netbird/management/server/activity"
 	"github.com/netbirdio/netbird/management/server/permissions"
@@ -184,6 +187,71 @@ func (m *Manager) replaceHostByLookup(ctx context.Context, accountID string, s *
 	return nil
 }
 
+// getRoutingPeerIP returns the NetBird IP of the first embedded peer in
+// the given proxy cluster. Used by the auto-DNS flow to point a private
+// service's A record at the cluster's routing peer.
+//
+// Limitation: returns a single peer's IP. A future change can emit one
+// record per cluster peer for round-robin DNS resolution and HA. Today
+// "routing peer offline = service unreachable" is a known constraint.
+func (m *Manager) getRoutingPeerIP(ctx context.Context, tx store.Store, accountID, proxyCluster string) (net.IP, error) {
+	if proxyCluster == "" {
+		return nil, status.Errorf(status.InvalidArgument,
+			"private service requires a proxy cluster")
+	}
+	peers, err := tx.GetAccountPeers(ctx, store.LockingStrengthNone, accountID, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("get account peers: %w", err)
+	}
+	var matches []*nbpeer.Peer
+	for _, p := range peers {
+		if p.ProxyMeta.Embedded && p.ProxyMeta.Cluster == proxyCluster {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 0 {
+		return nil, status.Errorf(status.PreconditionFailed,
+			"no embedded proxy peer found for cluster %q; check that at least one proxy in this cluster is connected and registered",
+			proxyCluster)
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].ID < matches[j].ID })
+	return matches[0].IP, nil
+}
+
+// reconcilePrivateDNS adjusts the auto-managed NetBird DNS record to
+// match the new service state. Called from inside the UpdateService
+// transaction. Skips ephemeral services (they have their own short-lived
+// lifecycle).
+func (m *Manager) reconcilePrivateDNS(ctx context.Context, tx store.Store, accountID string, svc *service.Service, info *serviceUpdateInfo) error {
+	if svc.Source == service.SourceEphemeral {
+		return nil
+	}
+	becamePrivate := !info.oldPrivate && svc.Private
+	becamePublic := info.oldPrivate && !svc.Private
+	stayedPrivate := info.oldPrivate && svc.Private
+	movedWhilePrivate := stayedPrivate && (info.domainChanged || info.clusterChanged)
+
+	switch {
+	case becamePublic:
+		return recordsmgr.AutoDeleteForService(ctx, tx, accountID, svc.ID)
+	case becamePrivate:
+		ip, err := m.getRoutingPeerIP(ctx, tx, accountID, svc.ProxyCluster)
+		if err != nil {
+			return err
+		}
+		_, err = recordsmgr.AutoCreateForService(ctx, tx, accountID, svc.ID, svc.Domain, ip)
+		return err
+	case movedWhilePrivate:
+		ip, err := m.getRoutingPeerIP(ctx, tx, accountID, svc.ProxyCluster)
+		if err != nil {
+			return err
+		}
+		_, err = recordsmgr.AutoUpdateForService(ctx, tx, accountID, svc.ID, svc.Domain, ip)
+		return err
+	}
+	return nil
+}
+
 func (m *Manager) GetService(ctx context.Context, accountID, userID, serviceID string) (*service.Service, error) {
 	ok, err := m.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Services, operations.Read)
 	if err != nil {
@@ -263,6 +331,14 @@ func (m *Manager) initializeServiceForCreate(ctx context.Context, accountID stri
 		}
 	}
 
+	if err := validateACMEConfig(service); err != nil {
+		return err
+	}
+
+	if err := validatePrivateConfig(service); err != nil {
+		return err
+	}
+
 	keyPair, err := sessionkey.GenerateKeyPair()
 	if err != nil {
 		return fmt.Errorf("generate session keys: %w", err)
@@ -311,6 +387,16 @@ func (m *Manager) persistNewService(ctx context.Context, accountID string, svc *
 
 		if err := transaction.CreateService(ctx, svc); err != nil {
 			return fmt.Errorf("create service: %w", err)
+		}
+
+		if svc.Private && svc.Source != service.SourceEphemeral {
+			ip, err := m.getRoutingPeerIP(ctx, transaction, accountID, svc.ProxyCluster)
+			if err != nil {
+				return err
+			}
+			if _, err := recordsmgr.AutoCreateForService(ctx, transaction, accountID, svc.ID, svc.Domain, ip); err != nil {
+				return err
+			}
 		}
 
 		return nil
@@ -522,7 +608,11 @@ func (m *Manager) UpdateService(ctx context.Context, accountID, userID string, s
 
 type serviceUpdateInfo struct {
 	oldCluster            string
+	oldDomain             string
+	oldPrivate            bool
 	domainChanged         bool
+	clusterChanged        bool
+	privateChanged        bool
 	serviceEnabledChanged bool
 }
 
@@ -584,6 +674,8 @@ func (m *Manager) executeServiceUpdate(ctx context.Context, transaction store.St
 	}
 
 	updateInfo.oldCluster = existingService.ProxyCluster
+	updateInfo.oldDomain = existingService.Domain
+	updateInfo.oldPrivate = existingService.Private
 	updateInfo.domainChanged = existingService.Domain != service.Domain
 
 	if updateInfo.domainChanged {
@@ -594,12 +686,21 @@ func (m *Manager) executeServiceUpdate(ctx context.Context, transaction store.St
 		service.ProxyCluster = existingService.ProxyCluster
 	}
 
+	updateInfo.clusterChanged = existingService.ProxyCluster != service.ProxyCluster
+	updateInfo.privateChanged = existingService.Private != service.Private
+
 	if err := m.validateSubdomainRequirement(ctx, service.Domain, service.ProxyCluster); err != nil {
 		return err
 	}
 
 	m.preserveExistingAuthSecrets(service, existingService)
 	if err := validateHeaderAuthValues(service.Auth.HeaderAuths); err != nil {
+		return err
+	}
+	if err := validateACMEConfig(service); err != nil {
+		return err
+	}
+	if err := validatePrivateConfig(service); err != nil {
 		return err
 	}
 	m.preserveServiceMetadata(service, existingService)
@@ -613,6 +714,9 @@ func (m *Manager) executeServiceUpdate(ctx context.Context, transaction store.St
 		return err
 	}
 	if err := validateTargetReferences(ctx, transaction, accountID, service.Targets); err != nil {
+		return err
+	}
+	if err := m.reconcilePrivateDNS(ctx, transaction, accountID, service, updateInfo); err != nil {
 		return err
 	}
 	if err := transaction.UpdateService(ctx, service); err != nil {
@@ -701,6 +805,66 @@ func validateHeaderAuthValues(headers []*service.HeaderAuthConfig) error {
 		}
 	}
 	return nil
+}
+
+// validateACMEConfig checks that the per-service ACME challenge fields are
+// internally consistent. Empty ChallengeType means "use the proxy's
+// configured default" and is always valid. DNSProvider is only meaningful
+// when ChallengeType is "dns-01".
+func validateACMEConfig(svc *service.Service) error {
+	switch svc.ChallengeType {
+	case "", "tls-alpn-01", "http-01", "dns-01":
+		// allowed
+	default:
+		return status.Errorf(status.InvalidArgument,
+			"challenge_type %q is not one of \"\", \"tls-alpn-01\", \"http-01\", \"dns-01\"",
+			svc.ChallengeType)
+	}
+
+	if svc.ChallengeType == "dns-01" && svc.DNSProvider == "" {
+		return status.Errorf(status.InvalidArgument,
+			"dns_provider is required when challenge_type is \"dns-01\"")
+	}
+
+	if svc.DNSProvider != "" && svc.ChallengeType != "dns-01" {
+		return status.Errorf(status.InvalidArgument,
+			"dns_provider may only be set when challenge_type is \"dns-01\"")
+	}
+
+	if svc.DNSCredentialsRef != "" && svc.ChallengeType != "dns-01" {
+		return status.Errorf(status.InvalidArgument,
+			"dns_credentials_ref may only be set when challenge_type is \"dns-01\"")
+	}
+
+	return nil
+}
+
+// validatePrivateConfig enforces constraints that apply when a service is
+// marked Private. Currently checks domain is set and challenge_type is
+// "dns-01" (other challenge types can't reach a service with no public
+// listener).
+func validatePrivateConfig(svc *service.Service) error {
+	if !svc.Private {
+		return nil
+	}
+	if svc.Domain == "" {
+		return status.Errorf(status.InvalidArgument,
+			"domain is required when private is true: there is no name to resolve")
+	}
+	switch svc.ChallengeType {
+	case "dns-01":
+		return nil
+	case "":
+		return status.Errorf(status.InvalidArgument,
+			"challenge_type is required when private is true; only \"dns-01\" is supported because private services are not publicly reachable")
+	case "http-01", "tls-alpn-01":
+		return status.Errorf(status.InvalidArgument,
+			"challenge_type %q cannot be used with a private service: that challenge requires public reachability. Use \"dns-01\" instead.",
+			svc.ChallengeType)
+	default:
+		// Unknown values are caught earlier by validateACMEConfig.
+		return nil
+	}
 }
 
 func (m *Manager) preserveServiceMetadata(service, existingService *service.Service) {
@@ -801,6 +965,10 @@ func (m *Manager) DeleteService(ctx context.Context, accountID, userID, serviceI
 			return err
 		}
 
+		if err := recordsmgr.AutoDeleteForService(ctx, transaction, accountID, serviceID); err != nil {
+			return fmt.Errorf("auto-delete dns record: %w", err)
+		}
+
 		if err = transaction.DeleteServiceTargets(ctx, accountID, serviceID); err != nil {
 			return fmt.Errorf("failed to delete targets: %w", err)
 		}
@@ -842,6 +1010,12 @@ func (m *Manager) DeleteAllServices(ctx context.Context, accountID, userID strin
 		}
 
 		for _, svc := range services {
+			if err := recordsmgr.AutoDeleteForService(ctx, transaction, accountID, svc.ID); err != nil {
+				return fmt.Errorf("auto-delete dns record: %w", err)
+			}
+			if err := transaction.DeleteServiceTargets(ctx, accountID, svc.ID); err != nil {
+				return fmt.Errorf("failed to delete targets: %w", err)
+			}
 			if err = transaction.DeleteService(ctx, accountID, svc.ID); err != nil {
 				return fmt.Errorf("failed to delete service: %w", err)
 			}

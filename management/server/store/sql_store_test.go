@@ -359,6 +359,7 @@ func TestSqlite_DeleteAccount(t *testing.T) {
 			Name:      "test service",
 			Domain:    "svc.example.com",
 			Enabled:   true,
+			Private:   true,
 			Targets: []*rpservice.Target{
 				{
 					AccountID: account.Id,
@@ -391,6 +392,18 @@ func TestSqlite_DeleteAccount(t *testing.T) {
 	o, err := store.GetAccountOnboarding(context.Background(), account.Id)
 	require.NoError(t, err)
 	require.Equal(t, o.AccountID, account.Id)
+
+	var savedServices []*rpservice.Service
+	err = store.(*SqlStore).db.Model(&rpservice.Service{}).Find(&savedServices, "account_id = ?", account.Id).Error
+	require.NoError(t, err)
+	require.Len(t, savedServices, 1, "expecting 1 service to be persisted after SaveAccount")
+	assert.True(t, savedServices[0].Private, "Private field should round-trip through DB save+load")
+
+	zone := zones.NewZone(account.Id, "Test Zone", "example.com", true, false, nil)
+	require.NoError(t, store.CreateZone(context.Background(), zone))
+	managed := records.NewRecord(account.Id, zone.ID, "svc.example.com", records.RecordTypeA, "10.0.0.42", 300)
+	managed.ManagedByServiceID = "service_id"
+	require.NoError(t, store.CreateDNSRecord(context.Background(), managed))
 
 	err = store.DeleteAccount(context.Background(), account)
 	require.NoError(t, err)
@@ -456,6 +469,12 @@ func TestSqlite_DeleteAccount(t *testing.T) {
 	err = store.(*SqlStore).db.Model(&rpservice.Target{}).Find(&targets, "account_id = ?", account.Id).Error
 	require.NoError(t, err, "expecting no error after DeleteAccount when searching for service targets")
 	require.Len(t, targets, 0, "expecting no service targets to be found after DeleteAccount")
+
+	var leftoverManaged []*records.Record
+	err = store.(*SqlStore).db.Model(&records.Record{}).
+		Find(&leftoverManaged, "account_id = ? AND managed_by_service_id <> ?", account.Id, "").Error
+	require.NoError(t, err)
+	require.Len(t, leftoverManaged, 0, "auto-managed DNS records should be cleaned by the account cascade")
 }
 
 func Test_GetAccount(t *testing.T) {
@@ -4336,6 +4355,7 @@ func TestSqlStore_CreateDNSRecord(t *testing.T) {
 	require.NoError(t, err)
 
 	record := records.NewRecord(accountID, zone.ID, "www.example.com", records.RecordTypeA, "192.168.1.1", 300)
+	record.ManagedByServiceID = "svc-abc123"
 
 	err = store.CreateDNSRecord(context.Background(), record)
 	require.NoError(t, err)
@@ -4349,6 +4369,7 @@ func TestSqlStore_CreateDNSRecord(t *testing.T) {
 	assert.Equal(t, record.Content, savedRecord.Content)
 	assert.Equal(t, record.TTL, savedRecord.TTL)
 	assert.Equal(t, zone.ID, savedRecord.ZoneID)
+	assert.Equal(t, "svc-abc123", savedRecord.ManagedByServiceID, "ManagedByServiceID should round-trip through DB save+load")
 }
 
 func TestSqlStore_GetDNSRecordByID(t *testing.T) {

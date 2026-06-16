@@ -70,10 +70,11 @@ type portRouter struct {
 }
 
 type Server struct {
-	mgmtClient    proto.ProxyServiceClient
-	proxy         *proxy.ReverseProxy
-	netbird       *roundtrip.NetBird
-	acme          *acme.Manager
+	mgmtClient      proto.ProxyServiceClient
+	proxy           *proxy.ReverseProxy
+	netbird         *roundtrip.NetBird
+	acme            *acme.Manager
+	autocertBackend *acme.AutocertBackend
 	auth          *auth.Middleware
 	http          *http.Server
 	https         *http.Server
@@ -130,9 +131,19 @@ type Server struct {
 	ACMEEABKID string
 	// ACMEEABHMACKey is the External Account Binding HMAC key (base64 URL-encoded) for CAs that require EAB.
 	ACMEEABHMACKey string
-	// ACMEChallengeType specifies the ACME challenge type: "http-01" or "tls-alpn-01".
-	// Defaults to "tls-alpn-01" if not specified.
+	// ACMEChallengeType specifies the ACME challenge type: "tls-alpn-01",
+	// "http-01", or "dns-01". Defaults to "tls-alpn-01" if not specified.
 	ACMEChallengeType string
+	// ACMEAccountEmail is the email used to register the ACME account.
+	// Required when ACMEChallengeType is "dns-01"; not used by autocert.
+	ACMEAccountEmail string
+	// ACMEDNSProvider names the DNS-01 provider (e.g., "cloudflare").
+	// Required when ACMEChallengeType is "dns-01".
+	ACMEDNSProvider string
+	// ACMEDNSCredentials is a provider-specific credential string for
+	// the DNS-01 provider. For "cloudflare", this is a scoped API token.
+	// Required when ACMEChallengeType is "dns-01".
+	ACMEDNSCredentials string
 	// CertLockMethod controls how ACME certificate locks are coordinated
 	// across replicas. Default: CertLockAuto (detect environment).
 	CertLockMethod acme.CertLockMethod
@@ -191,6 +202,11 @@ type Server struct {
 	// Zero means no cap (the proxy honors whatever management sends).
 	// Set via NB_PROXY_MAX_SESSION_IDLE_TIMEOUT for shared deployments.
 	MaxSessionIdleTimeout time.Duration
+	// NetBirdIP is the proxy's NetBird (WireGuard) interface IP. Required
+	// for serving private services. When nil, private mappings are
+	// rejected at processMappings time and public services keep working.
+	// Set via --netbird-ip / NB_PROXY_NETBIRD_IP.
+	NetBirdIP net.IP
 }
 
 // clampIdleTimeout returns d capped to MaxSessionIdleTimeout when configured.
@@ -357,6 +373,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) (err error) {
 	s.mainRouter = nbtcp.NewRouter(s.Logger, s.resolveDialFunc, ln.Addr())
 	s.mainRouter.SetObserver(s.meter)
 	s.mainRouter.SetAccessLogger(s.accessLog)
+	s.mainRouter.SetNetBirdIP(s.NetBirdIP)
 	close(s.routerReady)
 
 	// The HTTP server uses the chanListener fed by the SNI router.
@@ -591,15 +608,77 @@ func (s *Server) configureTLS(ctx context.Context) (*tls.Config, error) {
 		"acme_server":    s.ACMEDirectory,
 		"challenge_type": s.ACMEChallengeType,
 	}).Debug("ACME certificates enabled, configuring certificate manager")
-	var err error
+
+	switch s.ACMEChallengeType {
+	case "tls-alpn-01", "http-01", "dns-01":
+		// supported
+	default:
+		return nil, fmt.Errorf("unknown ACME challenge type %q", s.ACMEChallengeType)
+	}
+
+	// Build a multi-backend map so per-service ChallengeType selection
+	// can route to the appropriate backend. Construct any backend whose
+	// configuration is present, regardless of the global default — that
+	// way a service can opt into a non-default challenge type.
+	backends := make(map[string]acme.CertBackend, 3)
+
+	autocertBackend, err := acme.NewAutocertBackend(acme.AutocertBackendConfig{
+		CertDir:    s.CertificateDirectory,
+		ACMEURL:    s.ACMEDirectory,
+		EABKID:     s.ACMEEABKID,
+		EABHMACKey: s.ACMEEABHMACKey,
+		Logger:     s.Logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create autocert backend: %w", err)
+	}
+	s.autocertBackend = autocertBackend
+	backends["tls-alpn-01"] = autocertBackend
+	backends["http-01"] = autocertBackend
+
+	// Always construct a LegoBackend if we have a cert directory, so
+	// per-service dns-01 credentials (resolved from the encrypted store
+	// via the management RPC) can be used regardless of the global
+	// ACMEChallengeType. The legacy env-var fields (account email,
+	// provider, credentials) feed the manager-level fallback used when
+	// a service has no dns_credentials_ref.
+	legoBackend, err := acme.NewLegoBackend(acme.LegoBackendConfig{
+		CertDir: s.CertificateDirectory,
+		Logger:  s.Logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create lego backend: %w", err)
+	}
+	backends["dns-01"] = legoBackend
+
+	if s.ACMEChallengeType == "dns-01" && s.ACMEAccountEmail == "" {
+		return nil, fmt.Errorf("acme-challenge-type=dns-01 requires acme-account-email")
+	}
+
+	credResolver := func(ctx context.Context, accountID, ref string) (string, string, error) {
+		if s.mgmtClient == nil {
+			return "", "", fmt.Errorf("management client is not configured")
+		}
+		resp, err := s.mgmtClient.ResolveCredential(ctx, &proto.ResolveCredentialRequest{
+			AccountId:     accountID,
+			CredentialRef: ref,
+		})
+		if err != nil {
+			return "", "", err
+		}
+		return resp.GetSecret(), resp.GetProviderType(), nil
+	}
+
 	s.acme, err = acme.NewManager(acme.ManagerConfig{
-		CertDir:     s.CertificateDirectory,
-		ACMEURL:     s.ACMEDirectory,
-		EABKID:      s.ACMEEABKID,
-		EABHMACKey:  s.ACMEEABHMACKey,
-		LockMethod:  s.CertLockMethod,
-		WildcardDir: s.WildcardCertDir,
-	}, s, s.Logger, s.meter)
+		CertDir:                  s.CertificateDirectory,
+		LockMethod:               s.CertLockMethod,
+		WildcardDir:              s.WildcardCertDir,
+		ResolveCredential:        credResolver,
+		FallbackDNSCredentials:   s.ACMEDNSCredentials,
+		FallbackDNSProvider:      s.ACMEDNSProvider,
+		FallbackACMEAccountEmail: s.ACMEAccountEmail,
+		FallbackACMEDirectoryURL: s.ACMEDirectory,
+	}, backends, s.ACMEChallengeType, s, s.Logger, s.meter)
 	if err != nil {
 		return nil, fmt.Errorf("create ACME manager: %w", err)
 	}
@@ -609,7 +688,7 @@ func (s *Server) configureTLS(ctx context.Context) (*tls.Config, error) {
 	if s.ACMEChallengeType == "http-01" {
 		s.http = &http.Server{
 			Addr:     s.ACMEChallengeAddress,
-			Handler:  s.acme.HTTPHandler(nil),
+			Handler:  s.autocertBackend.HTTPHandler(nil),
 			ErrorLog: newHTTPServerLogger(s.Logger, logtagValueACME),
 		}
 		go func() {
@@ -618,10 +697,17 @@ func (s *Server) configureTLS(ctx context.Context) (*tls.Config, error) {
 			}
 		}()
 	}
-	tlsConfig = s.acme.TLSConfig()
 
-	// autocert.Manager.TLSConfig() wires its own GetCertificate, which
-	// bypasses our override that checks wildcards first.
+	if s.autocertBackend != nil {
+		// autocert.Manager.TLSConfig() pre-fills NextProtos for the
+		// tls-alpn-01 challenge; use it as the base. We override
+		// GetCertificate below to install the wildcard-aware path.
+		tlsConfig = s.autocertBackend.TLSConfig()
+	} else {
+		// dns-01: vanilla TLS config; the manager handles GetCertificate.
+		tlsConfig = &tls.Config{}
+	}
+
 	tlsConfig.GetCertificate = s.acme.GetCertificate
 
 	// ServerName needs to be set to allow for ACME to work correctly
@@ -876,6 +962,7 @@ func (s *Server) getOrCreatePortRouter(ctx context.Context, port uint16) (*nbtcp
 	router := nbtcp.NewPortRouter(s.Logger, s.resolveDialFunc)
 	router.SetObserver(s.meter)
 	router.SetAccessLogger(s.accessLog)
+	router.SetNetBirdIP(s.NetBirdIP)
 	portCtx, cancel := context.WithCancel(ctx)
 
 	s.portRouters[port] = &portRouter{
@@ -1040,6 +1127,26 @@ func (s *Server) processMappings(ctx context.Context, mappings []*proto.ProxyMap
 			"port":   mapping.GetListenPort(),
 			"id":     mapping.GetId(),
 		}).Debug("Processing mapping update")
+		if mapping.GetPrivate() && s.NetBirdIP == nil {
+			err := fmt.Errorf("proxy is missing NB_PROXY_NETBIRD_IP — cannot serve private services")
+			s.Logger.WithFields(log.Fields{
+				"service_id": mapping.GetId(),
+				"domain":     mapping.GetDomain(),
+				"account_id": mapping.GetAccountId(),
+				"action":     "private_mapping_rejected",
+			}).Error("private mapping rejected: NB_PROXY_NETBIRD_IP is not configured; configure --netbird-ip or NB_PROXY_NETBIRD_IP and restart the proxy")
+			s.notifyError(ctx, mapping, err)
+			continue
+		}
+		if mapping.GetPrivate() && mapping.GetType() == proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED {
+			s.Logger.WithFields(log.Fields{
+				"service_id": mapping.GetId(),
+				"domain":     mapping.GetDomain(),
+				"account_id": mapping.GetAccountId(),
+				"netbird_ip": s.NetBirdIP.String(),
+				"action":     "private_mapping_registered",
+			}).Info("registered private service: connections accepted only via NetBird interface")
+		}
 		switch mapping.GetType() {
 		case proto.ProxyMappingUpdateType_UPDATE_TYPE_CREATED:
 			if err := s.addMapping(ctx, mapping); err != nil {
@@ -1134,13 +1241,22 @@ func (s *Server) setupHTTPMapping(ctx context.Context, mapping *proto.ProxyMappi
 
 	var wildcardHit bool
 	if s.acme != nil {
-		wildcardHit = s.acme.AddDomain(d, accountID, svcID)
+		var err error
+		wildcardHit, err = s.acme.AddDomain(d, accountID, svcID, acme.AddDomainOptions{
+			ChallengeType:     mapping.GetChallengeType(),
+			DNSProvider:       mapping.GetDnsProvider(),
+			DNSCredentialsRef: mapping.GetDnsCredentialsRef(),
+		})
+		if err != nil {
+			return fmt.Errorf("register domain for ACME: %w", err)
+		}
 	}
 	s.mainRouter.AddRoute(nbtcp.SNIHost(mapping.GetDomain()), nbtcp.Route{
 		Type:      nbtcp.RouteHTTP,
 		AccountID: accountID,
 		ServiceID: svcID,
 		Domain:    mapping.GetDomain(),
+		Private:   mapping.GetPrivate(),
 	})
 	if err := s.updateMapping(ctx, mapping); err != nil {
 		return fmt.Errorf("update mapping for domain %q: %w", d, err)
@@ -1193,6 +1309,7 @@ func (s *Server) setupTCPMapping(ctx context.Context, mapping *proto.ProxyMappin
 		DialTimeout:        s.l4DialTimeout(mapping),
 		SessionIdleTimeout: s.clampIdleTimeout(l4SessionIdleTimeout(mapping)),
 		Filter:             s.parseRestrictions(mapping),
+		Private:            mapping.GetPrivate(),
 	})
 
 	s.portMu.Lock()
@@ -1268,6 +1385,7 @@ func (s *Server) setupTLSMapping(ctx context.Context, mapping *proto.ProxyMappin
 		DialTimeout:        s.l4DialTimeout(mapping),
 		SessionIdleTimeout: s.clampIdleTimeout(l4SessionIdleTimeout(mapping)),
 		Filter:             s.parseRestrictions(mapping),
+		Private:            mapping.GetPrivate(),
 	})
 
 	if tlsPort != s.mainPort {
@@ -1429,6 +1547,12 @@ func (s *Server) addUDPRelay(ctx context.Context, mapping *proto.ProxyMapping, t
 	s.removeUDPRelay(svcID)
 
 	listenAddr := fmt.Sprintf(":%d", listenPort)
+	if mapping.GetPrivate() {
+		if s.NetBirdIP == nil {
+			return fmt.Errorf("private UDP service %s requires NB_PROXY_NETBIRD_IP", svcID)
+		}
+		listenAddr = fmt.Sprintf("%s:%d", s.NetBirdIP.String(), listenPort)
+	}
 
 	listener, err := net.ListenPacket("udp", listenAddr)
 	if err != nil {

@@ -5,9 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/asn1"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/pem"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -19,8 +17,6 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/netbirdio/netbird/proxy/internal/certwatch"
 	"github.com/netbirdio/netbird/proxy/internal/types"
@@ -43,10 +39,14 @@ const (
 )
 
 type domainInfo struct {
-	accountID types.AccountID
-	serviceID types.ServiceID
-	state     domainState
-	err       string
+	accountID         types.AccountID
+	serviceID         types.ServiceID
+	state             domainState
+	err               string
+	challengeType     string
+	dnsProvider       string
+	dnsCredentialsRef string
+	backend           CertBackend
 }
 
 type metricsRecorder interface {
@@ -61,31 +61,67 @@ type wildcardEntry struct {
 	watcher *certwatch.Watcher
 }
 
-// ManagerConfig holds the configuration values for the ACME certificate manager.
+// CredentialResolver returns the decrypted DNS-01 credential for a given
+// account + reference. Implemented at the proxy layer as a closure over
+// the management gRPC client. Optional: when nil, the manager falls back
+// to env-var credentials (FallbackDNSCredentials) for dns-01 issuance.
+type CredentialResolver func(ctx context.Context, accountID, ref string) (secret, providerType string, err error)
+
+// ManagerConfig holds the orchestration configuration for the ACME
+// certificate manager. Backend-specific configuration (ACME URL, EAB
+// credentials, etc.) lives on the corresponding backend's config struct,
+// EXCEPT for dns-01 fallback / per-issuance values, which the manager
+// itself owns because they are passed per-call to LegoBackend.Issue.
 type ManagerConfig struct {
-	// CertDir is the directory used for caching ACME certificates.
+	// CertDir is the directory used for distributed lock files. Backends
+	// that persist certs to disk typically use the same directory.
 	CertDir string
-	// ACMEURL is the ACME directory URL (e.g. Let's Encrypt).
-	ACMEURL string
-	// EABKID and EABHMACKey are optional External Account Binding credentials
-	// required by some CAs (e.g. ZeroSSL). EABHMACKey is the base64
-	// URL-encoded string provided by the CA.
-	EABKID     string
-	EABHMACKey string
 	// LockMethod controls the cross-replica coordination strategy.
 	LockMethod CertLockMethod
 	// WildcardDir is an optional path to a directory containing wildcard
 	// certificate pairs (<name>.crt / <name>.key). Wildcard patterns are
 	// extracted from the certificates' SAN lists. Domains matching a
-	// wildcard are served from disk; all others go through ACME.
+	// wildcard are served from disk; all others go through the backend.
 	WildcardDir string
+
+	// ResolveCredential is called at issuance time to fetch the
+	// decrypted DNS-01 credential for a service that has a
+	// dns_credentials_ref. If nil, only the env-var fallback is
+	// available.
+	ResolveCredential CredentialResolver
+
+	// FallbackDNSCredentials, FallbackDNSProvider, FallbackACMEAccountEmail
+	// and FallbackACMEDirectoryURL provide the values used when a service
+	// has challenge_type=dns-01 but no dns_credentials_ref (legacy /
+	// env-var-driven deployments). All four must be non-empty for the
+	// fallback to apply.
+	FallbackDNSCredentials    string
+	FallbackDNSProvider       string
+	FallbackACMEAccountEmail  string
+	FallbackACMEDirectoryURL  string
 }
 
-// Manager wraps autocert.Manager with domain tracking and cross-replica
-// coordination via a pluggable locking strategy. The locker prevents
-// duplicate ACME requests when multiple replicas share a certificate cache.
+// Manager orchestrates certificate issuance and serving on top of one or
+// more pluggable CertBackends. It owns domain registration, distributed
+// locking, wildcard pre-filtering, and lifecycle notifications. Per-service
+// challenge-type selection routes each domain to the matching backend.
 type Manager struct {
-	*autocert.Manager
+	// backends are the registered backends keyed by ACME challenge type
+	// (e.g., "tls-alpn-01", "http-01", "dns-01"). One key per supported
+	// challenge type. tls-alpn-01 and http-01 typically share an
+	// AutocertBackend instance.
+	backends map[string]CertBackend
+	// defaultChallengeType is the fallback used when AddDomain is called
+	// without an explicit ChallengeType. Must exist as a key in backends.
+	defaultChallengeType string
+
+	// resolveCredential and the fallback* fields supply DNS-01 issuance
+	// credentials at prefetch time. See ManagerConfig for semantics.
+	resolveCredential        CredentialResolver
+	fallbackDNSCredentials   string
+	fallbackDNSProvider      string
+	fallbackACMEAccountEmail string
+	fallbackACMEDirectoryURL string
 
 	certDir string
 	locker  certLocker
@@ -100,18 +136,38 @@ type Manager struct {
 	metrics      metricsRecorder
 }
 
-// NewManager creates a new ACME certificate manager.
-func NewManager(cfg ManagerConfig, notifier certificateNotifier, logger *log.Logger, metrics metricsRecorder) (*Manager, error) {
+// NewManager creates a new ACME certificate manager. backends maps each
+// supported challenge-type string to a backend instance; defaultChallengeType
+// names the backend used for services that don't specify one explicitly. For
+// each backend that satisfies HostPolicySetter, the manager installs its
+// domain-registration check.
+func NewManager(cfg ManagerConfig, backends map[string]CertBackend, defaultChallengeType string, notifier certificateNotifier, logger *log.Logger, metrics metricsRecorder) (*Manager, error) {
+	if len(backends) == 0 {
+		return nil, fmt.Errorf("at least one backend is required")
+	}
+	if defaultChallengeType == "" {
+		return nil, fmt.Errorf("default challenge type is required")
+	}
+	if _, ok := backends[defaultChallengeType]; !ok {
+		return nil, fmt.Errorf("default challenge type %q has no registered backend", defaultChallengeType)
+	}
 	if logger == nil {
 		logger = log.StandardLogger()
 	}
 	mgr := &Manager{
-		certDir:      cfg.CertDir,
-		locker:       newCertLocker(cfg.LockMethod, cfg.CertDir, logger),
-		domains:      make(map[domain.Domain]*domainInfo),
-		certNotifier: notifier,
-		logger:       logger,
-		metrics:      metrics,
+		backends:                 backends,
+		defaultChallengeType:     defaultChallengeType,
+		resolveCredential:        cfg.ResolveCredential,
+		fallbackDNSCredentials:   cfg.FallbackDNSCredentials,
+		fallbackDNSProvider:      cfg.FallbackDNSProvider,
+		fallbackACMEAccountEmail: cfg.FallbackACMEAccountEmail,
+		fallbackACMEDirectoryURL: cfg.FallbackACMEDirectoryURL,
+		certDir:                  cfg.CertDir,
+		locker:                   newCertLocker(cfg.LockMethod, cfg.CertDir, logger),
+		domains:                  make(map[domain.Domain]*domainInfo),
+		certNotifier:             notifier,
+		logger:                   logger,
+		metrics:                  metrics,
 	}
 
 	if cfg.WildcardDir != "" {
@@ -122,30 +178,38 @@ func NewManager(cfg ManagerConfig, notifier certificateNotifier, logger *log.Log
 		mgr.wildcards = entries
 	}
 
-	var eab *acme.ExternalAccountBinding
-	if cfg.EABKID != "" && cfg.EABHMACKey != "" {
-		decodedKey, err := base64.RawURLEncoding.DecodeString(cfg.EABHMACKey)
-		if err != nil {
-			logger.Errorf("failed to decode EAB HMAC key: %v", err)
-		} else {
-			eab = &acme.ExternalAccountBinding{
-				KID: cfg.EABKID,
-				Key: decodedKey,
-			}
-			logger.Infof("configured External Account Binding with KID: %s", cfg.EABKID)
+	// Install the manager's host policy on every backend that supports
+	// it. Some backends (autocert) gate issuance on this policy; others
+	// (Lego) issue only for explicitly-requested domains and don't need
+	// it. Either way, this is safe and idempotent.
+	seen := make(map[CertBackend]struct{}, len(backends))
+	for _, backend := range backends {
+		if _, ok := seen[backend]; ok {
+			continue
+		}
+		seen[backend] = struct{}{}
+		if setter, ok := backend.(HostPolicySetter); ok {
+			setter.SetHostPolicy(mgr.hostPolicy)
 		}
 	}
 
-	mgr.Manager = &autocert.Manager{
-		Prompt:                 autocert.AcceptTOS,
-		HostPolicy:             mgr.hostPolicy,
-		Cache:                  autocert.DirCache(cfg.CertDir),
-		ExternalAccountBinding: eab,
-		Client: &acme.Client{
-			DirectoryURL: cfg.ACMEURL,
-		},
-	}
 	return mgr, nil
+}
+
+// AddDomainOptions carries the per-service ACME configuration consumed
+// by AddDomain. All fields are optional; empty values fall back to the
+// manager's defaults.
+type AddDomainOptions struct {
+	// ChallengeType selects the backend by challenge type. Empty means
+	// "use the default backend." Common values: "tls-alpn-01",
+	// "http-01", "dns-01".
+	ChallengeType string
+	// DNSProvider, when set, must match the configured Lego provider.
+	// Mismatch produces an error.
+	DNSProvider string
+	// DNSCredentialsRef is the opaque reference into the encrypted
+	// credential store, resolved at issuance time.
+	DNSCredentialsRef string
 }
 
 // WatchWildcards starts watching all wildcard certificate files for changes.
@@ -285,25 +349,62 @@ func (mgr *Manager) hostPolicy(_ context.Context, host string) error {
 
 // GetCertificate returns the TLS certificate for the given ClientHello.
 // If the requested domain matches a loaded wildcard, the static wildcard
-// certificate is returned. Otherwise, the ACME autocert manager handles
-// the request.
+// certificate is returned. Otherwise, the request is delegated to the
+// backend that was selected when the domain was registered (or to the
+// default backend if the domain was not explicitly registered).
 func (mgr *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	if e := mgr.findWildcardEntry(hello.ServerName); e != nil {
 		return e.watcher.GetCertificate(hello)
 	}
-	return mgr.Manager.GetCertificate(hello)
+	return mgr.backendForHost(hello.ServerName).GetCertificate(hello)
 }
 
-// AddDomain registers a domain for certificate management. Domains that
-// match a loaded wildcard are marked ready immediately (they use the
-// static wildcard certificate) and the method returns true. All other
-// domains go through ACME prefetch and the method returns false.
+// resolveBackend returns the backend matching opts.ChallengeType (or the
+// default if empty). Returns an error if the requested challenge type is
+// not registered, or if opts.DNSProvider conflicts with the configured
+// provider for the chosen backend.
+func (mgr *Manager) resolveBackend(opts AddDomainOptions) (CertBackend, string, error) {
+	ct := opts.ChallengeType
+	if ct == "" {
+		ct = mgr.defaultChallengeType
+	}
+	backend, ok := mgr.backends[ct]
+	if !ok {
+		return nil, "", fmt.Errorf("no backend registered for challenge type %q", ct)
+	}
+	// Per-service DNSProvider/DNSCredentialsRef validation against the
+	// resolver response is performed at issuance time in prefetchCertificate.
+	return backend, ct, nil
+}
+
+// backendForHost returns the backend selected for the given host, or
+// the default backend if the host has not been explicitly registered.
+func (mgr *Manager) backendForHost(host string) CertBackend {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	if info, ok := mgr.domains[domain.Domain(host)]; ok && info.backend != nil {
+		return info.backend
+	}
+	return mgr.backends[mgr.defaultChallengeType]
+}
+
+// AddDomain registers a domain for certificate management with the
+// backend selected by opts.ChallengeType (or the default if empty).
+// Domains that match a loaded wildcard are marked ready immediately
+// (they use the static wildcard certificate) and the method returns
+// (true, nil). Other domains go through ACME prefetch on the selected
+// backend and the method returns (false, nil).
 //
-// When AddDomain returns true the caller is responsible for sending any
-// certificate-ready notifications after the surrounding operation (e.g.
-// mapping update) has committed successfully.
-func (mgr *Manager) AddDomain(d domain.Domain, accountID types.AccountID, serviceID types.ServiceID) (wildcardHit bool) {
+// When the domain is already registered with a different backend (e.g.
+// a service flipping from http-01 → dns-01), the previous backend's
+// cert is deleted before the new backend takes over.
+//
+// When AddDomain returns (true, _) the caller is responsible for
+// sending any certificate-ready notifications after the surrounding
+// operation (e.g. mapping update) has committed successfully.
+func (mgr *Manager) AddDomain(d domain.Domain, accountID types.AccountID, serviceID types.ServiceID, opts AddDomainOptions) (wildcardHit bool, err error) {
 	name := d.PunycodeString()
+
 	if e := mgr.findWildcardEntry(name); e != nil {
 		mgr.mu.Lock()
 		mgr.domains[d] = &domainInfo{
@@ -313,19 +414,42 @@ func (mgr *Manager) AddDomain(d domain.Domain, accountID types.AccountID, servic
 		}
 		mgr.mu.Unlock()
 		mgr.logger.Debugf("domain %q matches wildcard %q, using static certificate", name, e.pattern)
-		return true
+		return true, nil
 	}
 
+	backend, ct, err := mgr.resolveBackend(opts)
+	if err != nil {
+		return false, err
+	}
+
+	// Detect a challenge-type conversion: if the domain was previously
+	// registered with a different backend, delete the orphan cert from
+	// the old backend before swapping. Run synchronously so the new
+	// prefetch starts from a clean slate.
 	mgr.mu.Lock()
+	prev := mgr.domains[d]
 	mgr.domains[d] = &domainInfo{
-		accountID: accountID,
-		serviceID: serviceID,
-		state:     domainPending,
+		accountID:         accountID,
+		serviceID:         serviceID,
+		state:             domainPending,
+		challengeType:     ct,
+		dnsProvider:       opts.DNSProvider,
+		dnsCredentialsRef: opts.DNSCredentialsRef,
+		backend:           backend,
 	}
 	mgr.mu.Unlock()
 
+	if prev != nil && prev.backend != nil && prev.backend != backend {
+		mgr.logger.Infof("domain %q changed challenge type %q→%q; cleaning up old cert", name, prev.challengeType, ct)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := prev.backend.DeleteCert(ctx, name); err != nil {
+			mgr.logger.Warnf("delete previous cert for domain %q during conversion: %v", name, err)
+		}
+		cancel()
+	}
+
 	go mgr.prefetchCertificate(d)
-	return false
+	return false, nil
 }
 
 // prefetchCertificate proactively triggers certificate generation for a domain.
@@ -343,6 +467,8 @@ func (mgr *Manager) prefetchCertificate(d domain.Domain) {
 
 	name := d.PunycodeString()
 
+	backend := mgr.backendForHost(name)
+
 	mgr.logger.Infof("acquiring cert lock for domain %q", name)
 	lockStart := time.Now()
 	unlock, err := mgr.locker.Lock(ctx, name)
@@ -353,9 +479,30 @@ func (mgr *Manager) prefetchCertificate(d domain.Domain) {
 		defer unlock()
 	}
 
-	if cert, err := mgr.readCertFromDisk(ctx, name); err == nil {
+	if cert, err := backend.ReadCertFromDisk(ctx, name); err == nil {
 		mgr.logger.Infof("certificate for domain %q already on disk, skipping ACME", name)
 		mgr.recordAndNotify(ctx, d, name, cert, 0)
+		return
+	}
+
+	// dns-01 path: LegoBackend requires per-issuance credentials, which
+	// the manager fetches from the encrypted store via ResolveCredential
+	// (or, for legacy deployments, the env-var fallback). Issuance is
+	// synchronous — there is no race with disk reads because this path
+	// owns the cert file.
+	if legoBackend, ok := backend.(*LegoBackend); ok {
+		if err := mgr.issueViaLego(ctx, d, name, legoBackend); err != nil {
+			mgr.logger.Warnf("dns-01 issuance for domain %q failed: %v", name, err)
+			mgr.setDomainState(d, domainFailed, err.Error())
+			return
+		}
+		cert, err := legoBackend.ReadCertFromDisk(ctx, name)
+		if err != nil {
+			mgr.logger.Warnf("reload cert for domain %q after Lego issuance: %v", name, err)
+			mgr.setDomainState(d, domainFailed, err.Error())
+			return
+		}
+		mgr.recordAndNotify(ctx, d, name, cert, time.Since(lockStart))
 		return
 	}
 
@@ -389,7 +536,7 @@ func (mgr *Manager) prefetchCertificate(d domain.Domain) {
 			return
 
 		case <-diskTicker.C:
-			cert, err := mgr.readCertFromDisk(context.Background(), name)
+			cert, err := backend.ReadCertFromDisk(context.Background(), name)
 			if err != nil {
 				continue
 			}
@@ -413,40 +560,62 @@ func (mgr *Manager) prefetchCertificate(d domain.Domain) {
 	}
 }
 
-// readCertFromDisk reads and parses a certificate directly from the autocert
-// DirCache, bypassing autocert's internal certState mutex. Safe to call
-// concurrently with an in-flight ACME request for the same domain.
-func (mgr *Manager) readCertFromDisk(ctx context.Context, name string) (*tls.Certificate, error) {
-	if mgr.Cache == nil {
-		return nil, fmt.Errorf("no cache configured")
-	}
-	data, err := mgr.Cache.Get(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	privBlock, certsPEM := pem.Decode(data)
-	if privBlock == nil || !strings.Contains(privBlock.Type, "PRIVATE") {
-		return nil, fmt.Errorf("no private key in cache for %q", name)
-	}
-	cert, err := tls.X509KeyPair(certsPEM, pem.EncodeToMemory(privBlock))
-	if err != nil {
-		return nil, fmt.Errorf("parse cached certificate for %q: %w", name, err)
-	}
-	if len(cert.Certificate) > 0 {
-		leaf, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			return nil, fmt.Errorf("parse leaf for %q: %w", name, err)
-		}
-		if time.Now().After(leaf.NotAfter) {
-			return nil, fmt.Errorf("cached certificate for %q expired at %s", name, leaf.NotAfter)
-		}
-		cert.Leaf = leaf
-	}
-	return &cert, nil
-}
-
 // recordAndNotify records metrics, marks the domain ready, logs cert details,
 // and notifies the cert notifier.
+// issueViaLego performs DNS-01 issuance for the given domain via the
+// LegoBackend. Resolves credentials per-call from the encrypted store
+// (via mgr.resolveCredential) when the service has a dns_credentials_ref;
+// otherwise falls back to the env-var-driven values stored on the
+// manager. Returns an error if neither path can produce credentials.
+func (mgr *Manager) issueViaLego(ctx context.Context, d domain.Domain, name string, legoBackend *LegoBackend) error {
+	mgr.mu.RLock()
+	info := mgr.domains[d]
+	mgr.mu.RUnlock()
+	if info == nil {
+		return fmt.Errorf("no tracked info for domain %q", name)
+	}
+
+	var (
+		secret       string
+		providerName string
+	)
+	switch {
+	case info.dnsCredentialsRef != "" && mgr.resolveCredential != nil:
+		var resolvedProvider string
+		var err error
+		secret, resolvedProvider, err = mgr.resolveCredential(ctx, string(info.accountID), info.dnsCredentialsRef)
+		if err != nil {
+			return fmt.Errorf("resolve credential ref %q: %w", info.dnsCredentialsRef, err)
+		}
+		providerName = info.dnsProvider
+		if providerName == "" {
+			providerName = resolvedProvider
+		}
+		if info.dnsProvider != "" && resolvedProvider != "" && info.dnsProvider != resolvedProvider {
+			return fmt.Errorf("service requested DNS provider %q but credential is for %q", info.dnsProvider, resolvedProvider)
+		}
+	case mgr.fallbackDNSCredentials != "" && mgr.fallbackDNSProvider != "":
+		secret = mgr.fallbackDNSCredentials
+		providerName = mgr.fallbackDNSProvider
+		if info.dnsProvider != "" && info.dnsProvider != providerName {
+			return fmt.Errorf("service requested DNS provider %q but proxy fallback is configured for %q", info.dnsProvider, providerName)
+		}
+	default:
+		return fmt.Errorf("no DNS-01 credentials available for domain %q (set dns_credentials_ref on the service or configure NB_PROXY_ACME_DNS_* env vars)", name)
+	}
+
+	accountEmail := mgr.fallbackACMEAccountEmail
+	acmeURL := mgr.fallbackACMEDirectoryURL
+	if accountEmail == "" {
+		return fmt.Errorf("ACME account email is not configured (set NB_PROXY_ACME_ACCOUNT_EMAIL)")
+	}
+	if acmeURL == "" {
+		return fmt.Errorf("ACME directory URL is not configured")
+	}
+
+	return legoBackend.Issue(ctx, name, providerName, accountEmail, acmeURL, secret)
+}
+
 func (mgr *Manager) recordAndNotify(ctx context.Context, d domain.Domain, name string, cert *tls.Certificate, elapsed time.Duration) {
 	if elapsed > 0 && mgr.metrics != nil {
 		mgr.metrics.RecordCertificateIssuance(elapsed)
@@ -579,11 +748,24 @@ func (c *dummyConn) SetDeadline(t time.Time) error      { return nil }
 func (c *dummyConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *dummyConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// RemoveDomain removes a domain from tracking.
+// RemoveDomain removes a domain from tracking and deletes its cached
+// certificate from the backend that owned it. The cert deletion is
+// best-effort — failures are logged but not returned, since the domain
+// is being removed regardless. Idempotent.
 func (mgr *Manager) RemoveDomain(d domain.Domain) {
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
+	prev := mgr.domains[d]
 	delete(mgr.domains, d)
+	mgr.mu.Unlock()
+
+	if prev == nil || prev.backend == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := prev.backend.DeleteCert(ctx, d.PunycodeString()); err != nil {
+		mgr.logger.Warnf("delete cert for removed domain %q: %v", d.PunycodeString(), err)
+	}
 }
 
 // PendingCerts returns the number of certificates currently being prefetched.

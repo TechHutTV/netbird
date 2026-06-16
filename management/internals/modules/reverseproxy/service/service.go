@@ -200,6 +200,25 @@ type Service struct {
 	Mode             string `gorm:"default:'http'"`
 	ListenPort       uint16
 	PortAutoAssigned bool
+
+	// ChallengeType selects the ACME challenge for this service's
+	// certificate. Empty means "use the proxy's configured default"
+	// (which today is also driven by NB_PROXY_ACME_CHALLENGE_TYPE).
+	// Allowed values: "", "tls-alpn-01", "http-01", "dns-01".
+	ChallengeType string
+	// DNSProvider names the DNS provider to use when ChallengeType is
+	// "dns-01" (e.g., "cloudflare", "route53", "rfc2136"). Required
+	// when ChallengeType is "dns-01"; must be empty otherwise.
+	DNSProvider string
+	// DNSCredentialsRef is an opaque reference to an encrypted DNS
+	// provider credential record. Resolved at issuance time by the
+	// proxy. Empty until per-service credential storage lands.
+	DNSCredentialsRef string
+	// Private marks the service as local-only: when true, the service
+	// is reachable only from inside the NetBird mesh. The management
+	// server auto-creates an internal DNS record, the proxy listener
+	// rejects non-mesh connections, and DNS-01 cert issuance is required.
+	Private bool
 }
 
 // InitNewRecord generates a new unique ID and resets metadata for a newly created
@@ -295,6 +314,7 @@ func (s *Service) ToAPIResponse() *api.Service {
 		RewriteRedirects:   &s.RewriteRedirects,
 		Auth:               authConfig,
 		AccessRestrictions: restrictionsToAPI(s.Restrictions),
+		Private:            &s.Private,
 		Meta:               meta,
 		Mode:               &mode,
 		ListenPort:         &listenPort,
@@ -303,6 +323,18 @@ func (s *Service) ToAPIResponse() *api.Service {
 
 	if s.ProxyCluster != "" {
 		resp.ProxyCluster = &s.ProxyCluster
+	}
+
+	if s.ChallengeType != "" {
+		ct := api.ServiceChallengeType(s.ChallengeType)
+		resp.ChallengeType = &ct
+	}
+	if s.DNSProvider != "" {
+		dp := api.ServiceDnsProvider(s.DNSProvider)
+		resp.DnsProvider = &dp
+	}
+	if s.DNSCredentialsRef != "" {
+		resp.DnsCredentialsRef = &s.DNSCredentialsRef
 	}
 
 	return resp
@@ -353,6 +385,20 @@ func (s *Service) ToProtoMapping(operation Operation, authToken string, oidcConf
 
 	if r := restrictionsToProto(s.Restrictions); r != nil {
 		mapping.AccessRestrictions = r
+	}
+
+	if s.ChallengeType != "" {
+		mapping.ChallengeType = &s.ChallengeType
+	}
+	if s.DNSProvider != "" {
+		mapping.DnsProvider = &s.DNSProvider
+	}
+	if s.DNSCredentialsRef != "" {
+		mapping.DnsCredentialsRef = &s.DNSCredentialsRef
+	}
+	if s.Private {
+		v := true
+		mapping.Private = &v
 	}
 
 	return mapping
@@ -562,6 +608,20 @@ func (s *Service) FromAPIRequest(req *api.ServiceRequest, accountID string) erro
 			return err
 		}
 		s.Restrictions = restrictions
+	}
+
+	if req.ChallengeType != nil {
+		s.ChallengeType = string(*req.ChallengeType)
+	}
+	if req.DnsProvider != nil {
+		s.DNSProvider = string(*req.DnsProvider)
+	}
+	if req.DnsCredentialsRef != nil {
+		s.DNSCredentialsRef = *req.DnsCredentialsRef
+	}
+
+	if req.Private != nil {
+		s.Private = *req.Private
 	}
 
 	return nil

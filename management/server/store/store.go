@@ -25,6 +25,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/netbirdio/netbird/dns"
+	"github.com/netbirdio/netbird/management/internals/modules/credentials"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/domain"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/proxy"
@@ -271,7 +272,7 @@ type Store interface {
 	GetCustomDomain(ctx context.Context, accountID string, domainID string) (*domain.Domain, error)
 	ListFreeDomains(ctx context.Context, accountID string) ([]string, error)
 	ListCustomDomains(ctx context.Context, accountID string) ([]*domain.Domain, error)
-	CreateCustomDomain(ctx context.Context, accountID string, domainName string, targetCluster string, validated bool) (*domain.Domain, error)
+	CreateCustomDomain(ctx context.Context, accountID string, domainName string, targetCluster string, validated bool, autoConfig *domain.AutoConfigureRecord) (*domain.Domain, error)
 	UpdateCustomDomain(ctx context.Context, accountID string, d *domain.Domain) (*domain.Domain, error)
 	DeleteCustomDomain(ctx context.Context, accountID string, domainID string) error
 
@@ -295,6 +296,12 @@ type Store interface {
 	GetCustomDomainsCounts(ctx context.Context) (total int64, validated int64, err error)
 
 	GetRoutingPeerNetworks(ctx context.Context, accountID, peerID string) ([]string, error)
+
+	CreateCredential(ctx context.Context, c *credentials.Credential) error
+	GetCredentialByRef(ctx context.Context, accountID, ref string) (*credentials.Credential, error)
+	ListCredentialsByAccount(ctx context.Context, accountID, providerTypeFilter string) ([]*credentials.Credential, error)
+	UpdateCredential(ctx context.Context, c *credentials.Credential) error
+	DeleteCredential(ctx context.Context, accountID, ref string) error
 }
 
 const (
@@ -454,6 +461,9 @@ func getMigrationsPreAuto(ctx context.Context) []migrationFunc {
 		},
 		func(db *gorm.DB) error {
 			return migration.CleanupOrphanedResources[domain.Domain, types.Account](ctx, db, "account_id")
+		},
+		func(db *gorm.DB) error {
+			return migration.CleanupOrphanedManagedRecords[records.Record, rpservice.Service, types.Account](ctx, db)
 		},
 	}
 }

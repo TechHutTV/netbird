@@ -28,6 +28,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	nbdns "github.com/netbirdio/netbird/dns"
+	"github.com/netbirdio/netbird/management/internals/modules/credentials"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs"
 	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/domain"
 
@@ -135,6 +136,7 @@ func NewSqlStore(ctx context.Context, db *gorm.DB, storeEngine types.Engine, met
 		&networkTypes.Network{}, &routerTypes.NetworkRouter{}, &resourceTypes.NetworkResource{}, &types.AccountOnboarding{},
 		&types.Job{}, &zones.Zone{}, &records.Record{}, &types.UserInviteRecord{}, &rpservice.Service{}, &rpservice.Target{}, &domain.Domain{},
 		&accesslogs.AccessLogEntry{}, &proxy.Proxy{},
+		&credentials.Credential{},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("auto migratePreAuto: %w", err)
@@ -392,6 +394,14 @@ func (s *SqlStore) DeleteAccount(ctx context.Context, account *types.Account) er
 		}
 
 		result = tx.Select(clause.Associations).Delete(account.UsersG, "account_id = ?", account.Id)
+		if result.Error != nil {
+			return result.Error
+		}
+
+		// Clean up auto-managed DNS records for the account before
+		// cascading services. User-managed records (managed_by_service_id
+		// == "") are untouched.
+		result = tx.Where("account_id = ? AND managed_by_service_id <> ?", account.Id, "").Delete(&records.Record{})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -5229,7 +5239,7 @@ func (s *SqlStore) ListCustomDomains(ctx context.Context, accountID string) ([]*
 	return domains, nil
 }
 
-func (s *SqlStore) CreateCustomDomain(ctx context.Context, accountID string, domainName string, targetCluster string, validated bool) (*domain.Domain, error) {
+func (s *SqlStore) CreateCustomDomain(ctx context.Context, accountID string, domainName string, targetCluster string, validated bool, autoConfig *domain.AutoConfigureRecord) (*domain.Domain, error) {
 	newDomain := &domain.Domain{
 		ID:            xid.New().String(), // Generate our own ID because gorm doesn't always configure the database to handle this for us.
 		Domain:        domainName,
@@ -5237,6 +5247,11 @@ func (s *SqlStore) CreateCustomDomain(ctx context.Context, accountID string, dom
 		TargetCluster: targetCluster,
 		Type:          domain.TypeCustom,
 		Validated:     validated,
+	}
+	if autoConfig != nil {
+		newDomain.AutoConfigured = true
+		newDomain.AutoConfiguredCredentialID = autoConfig.CredentialID
+		newDomain.AutoConfiguredProvider = autoConfig.Provider
 	}
 	result := s.db.Create(newDomain)
 	if result.Error != nil {
@@ -5692,4 +5707,86 @@ func (s *SqlStore) GetRoutingPeerNetworks(_ context.Context, accountID, peerID s
 	}
 
 	return names, nil
+}
+
+// CreateCredential persists a new encrypted credential record.
+func (s *SqlStore) CreateCredential(ctx context.Context, c *credentials.Credential) error {
+	if result := s.db.Create(c); result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to create credential in store: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to create credential in store")
+	}
+	return nil
+}
+
+// GetCredentialByRef fetches a single credential by its ref, scoped to
+// the calling account. Returns NotFound if no record matches; this is
+// also the cross-account behavior (callers cannot probe for ref existence
+// in other accounts).
+func (s *SqlStore) GetCredentialByRef(ctx context.Context, accountID, ref string) (*credentials.Credential, error) {
+	var c credentials.Credential
+	err := s.db.
+		Where(accountAndIDQueryCondition, accountID, ref).
+		First(&c).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, status.Errorf(status.NotFound, "credential %s not found", ref)
+	}
+	if err != nil {
+		log.WithContext(ctx).Errorf("failed to fetch credential from store: %s", err)
+		return nil, status.Errorf(status.Internal, "failed to fetch credential from store")
+	}
+	return &c, nil
+}
+
+// ListCredentialsByAccount returns all credentials for the given
+// account, optionally filtered by provider type.
+func (s *SqlStore) ListCredentialsByAccount(ctx context.Context, accountID, providerTypeFilter string) ([]*credentials.Credential, error) {
+	var out []*credentials.Credential
+	q := s.db.Where(accountIDCondition, accountID)
+	if providerTypeFilter != "" {
+		q = q.Where("provider_type = ?", providerTypeFilter)
+	}
+	if err := q.Find(&out).Error; err != nil {
+		log.WithContext(ctx).Errorf("failed to list credentials from store: %s", err)
+		return nil, status.Errorf(status.Internal, "failed to list credentials from store")
+	}
+	return out, nil
+}
+
+// DeleteCredential removes a credential by its ref, scoped to the
+// calling account.
+func (s *SqlStore) DeleteCredential(ctx context.Context, accountID, ref string) error {
+	result := s.db.
+		Where(accountAndIDQueryCondition, accountID, ref).
+		Delete(&credentials.Credential{})
+	if result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to delete credential from store: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to delete credential from store")
+	}
+	if result.RowsAffected == 0 {
+		return status.Errorf(status.NotFound, "credential %s not found", ref)
+	}
+	return nil
+}
+
+// UpdateCredential updates the encrypted secret (and optionally the
+// provider type and name) for an existing credential. Scoped to the
+// calling account: rows owned by other accounts are not affected and
+// the call returns NotFound for refs not present in this account.
+func (s *SqlStore) UpdateCredential(ctx context.Context, c *credentials.Credential) error {
+	result := s.db.
+		Model(&credentials.Credential{}).
+		Where(accountAndIDQueryCondition, c.AccountID, c.ID).
+		Updates(map[string]any{
+			"provider_type":    c.ProviderType,
+			"name":             c.Name,
+			"encrypted_secret": c.EncryptedSecret,
+		})
+	if result.Error != nil {
+		log.WithContext(ctx).Errorf("failed to update credential in store: %s", result.Error)
+		return status.Errorf(status.Internal, "failed to update credential in store")
+	}
+	if result.RowsAffected == 0 {
+		return status.Errorf(status.NotFound, "credential %s not found", c.ID)
+	}
+	return nil
 }

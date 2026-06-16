@@ -25,6 +25,29 @@ service ProxyService {
   // ValidateSession validates a session token and checks user access permissions.
   // Called by the proxy after receiving a session token from OIDC callback.
   rpc ValidateSession(ValidateSessionRequest) returns (ValidateSessionResponse);
+
+  // ResolveCredential returns the decrypted DNS provider credential for
+  // the given account + reference. Called by the proxy at issuance time
+  // for services configured with challenge_type=dns-01 + dns_credentials_ref.
+  // The management server audit-logs every resolve.
+  rpc ResolveCredential(ResolveCredentialRequest) returns (ResolveCredentialResponse);
+}
+
+message ResolveCredentialRequest {
+  // AccountID owning the credential.
+  string account_id = 1;
+  // CredentialRef matches the dns_credentials_ref field on a ProxyMapping.
+  string credential_ref = 2;
+}
+
+message ResolveCredentialResponse {
+  // Secret is the decrypted credential value to feed to the DNS provider
+  // (e.g., a Cloudflare API token).
+  string secret = 1;
+  // ProviderType is the credential's stored provider name (e.g.,
+  // "cloudflare"). The proxy validates this matches the service's
+  // dns_provider field.
+  string provider_type = 2;
 }
 
 // ProxyCapabilities describes what a proxy can handle.
@@ -129,6 +152,21 @@ message ProxyMapping {
   // For L4/TLS: the port the proxy listens on.
   int32 listen_port = 11;
   AccessRestrictions access_restrictions = 12;
+  // ACME challenge type for cert issuance: "" (use server default),
+  // "tls-alpn-01", "http-01", or "dns-01".
+  optional string challenge_type = 13;
+  // DNS provider name for dns-01 issuance (e.g., "cloudflare",
+  // "route53", "rfc2136"). Required when challenge_type is "dns-01";
+  // must be empty otherwise.
+  optional string dns_provider = 14;
+  // Opaque reference to the encrypted DNS provider credential record.
+  // Resolved by the proxy when invoking the dns-01 issuer.
+  optional string dns_credentials_ref = 15;
+  // When true, the service is private: it lives entirely inside the
+  // NetBird mesh, with no public listener and no public DNS record.
+  // Older proxies that don't recognize this field treat the service
+  // as public (the safe default).
+  optional bool private = 16;
 }
 
 // SendAccessLogRequest consists of one or more AccessLogs from a Proxy.

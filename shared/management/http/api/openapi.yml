@@ -1357,6 +1357,75 @@ components:
           required:
             - peers
             - resources
+    CredentialRequest:
+      type: object
+      description: |
+        Credential to store. The plaintext secret(s) are sent in the
+        request body and immediately encrypted at rest in the management
+        database. They are never returned on subsequent reads.
+
+        Use `secret_fields` for multi-field providers (Route 53, RFC 2136).
+        For single-token providers (Cloudflare, DigitalOcean), either
+        `secret_fields` (preferred) or the legacy `secret` (single string)
+        is accepted. Exactly one of `secret` and `secret_fields` should be
+        set.
+      properties:
+        provider_type:
+          type: string
+          description: Identifier of the consumer (e.g., "cloudflare", "route53", "digitalocean", "rfc2136").
+          example: cloudflare
+        name:
+          type: string
+          description: User-friendly label.
+          example: Cloudflare DNS edit
+        secret:
+          type: string
+          description: |
+            Legacy single-string secret. Convenient for single-token providers
+            (Cloudflare, DigitalOcean) where only one value is required.
+            Internally wrapped as the provider's primary key (e.g.,
+            "auth_token") at write time.
+          example: cf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        secret_fields:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Per-field secret values for multi-field providers (Route 53:
+            access_key_id + secret_access_key + optional region/hosted_zone_id;
+            RFC 2136: nameserver + tsig_algorithm + tsig_key + tsig_secret).
+          example:
+            access_key_id: AKIAEXAMPLE
+            secret_access_key: shhhhh
+            region: us-east-1
+      required:
+        - provider_type
+        - name
+    Credential:
+      type: object
+      description: Credential metadata. The secret value is never included on responses.
+      properties:
+        id:
+          type: string
+          description: Opaque server-generated reference for the credential.
+          example: 0c7b4a1e-7e9b-4f6e-8d2a-b3a3a85b1c45
+        provider_type:
+          type: string
+          description: Identifier of the consumer.
+          example: cloudflare
+        name:
+          type: string
+          description: User-friendly label.
+          example: Cloudflare DNS edit
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp.
+      required:
+        - id
+        - provider_type
+        - name
+        - created_at
     PolicyRuleMinimum:
       type: object
       properties:
@@ -2256,6 +2325,12 @@ components:
               description: DNS record ID
               type: string
               example: ch8i4ug6lnn4g9hqv7m0
+            managed_by_service_id:
+              description: |
+                ID of the reverse-proxy service that owns this record's lifecycle.
+                When non-empty, the record is auto-managed and read-only via this API.
+              type: string
+              example: chq21j46lnn5g9hqv7m0
           required:
             - id
         - $ref: '#/components/schemas/DNSRecordRequest'
@@ -3033,6 +3108,25 @@ components:
           $ref: '#/components/schemas/ServiceAuthConfig'
         access_restrictions:
           $ref: '#/components/schemas/AccessRestrictions'
+        challenge_type:
+          type: string
+          description: ACME challenge type for cert issuance. Empty means use the proxy's globally-configured default.
+          enum: [tls-alpn-01, http-01, dns-01]
+          example: "dns-01"
+        dns_provider:
+          type: string
+          description: DNS provider for dns-01 issuance. Required when challenge_type is "dns-01"; must be empty otherwise.
+          enum: [cloudflare, route53, digitalocean, rfc2136]
+          example: "cloudflare"
+        dns_credentials_ref:
+          type: string
+          description: Opaque reference to the encrypted credential record for dns-01 issuance.
+          example: "ch8i4ug6lnn4g9hqv7m0"
+        private:
+          type: boolean
+          description: When true, the service is local-only, reachable only from inside the NetBird mesh. The management server auto-creates an internal DNS record and the proxy listener rejects non-mesh connections.
+          default: false
+          example: false
         meta:
           $ref: '#/components/schemas/ServiceMeta'
       required:
@@ -3115,6 +3209,25 @@ components:
           $ref: '#/components/schemas/ServiceAuthConfig'
         access_restrictions:
           $ref: '#/components/schemas/AccessRestrictions'
+        challenge_type:
+          type: string
+          description: ACME challenge type for cert issuance. Empty means use the proxy's globally-configured default.
+          enum: [tls-alpn-01, http-01, dns-01]
+          example: "dns-01"
+        dns_provider:
+          type: string
+          description: DNS provider for dns-01 issuance. Required when challenge_type is "dns-01"; must be empty otherwise.
+          enum: [cloudflare, route53, digitalocean, rfc2136]
+          example: "cloudflare"
+        dns_credentials_ref:
+          type: string
+          description: Opaque reference to the encrypted credential record for dns-01 issuance.
+          example: "ch8i4ug6lnn4g9hqv7m0"
+        private:
+          type: boolean
+          description: When true, the service is local-only. Requires challenge_type "dns-01".
+          default: false
+          example: false
       required:
         - name
         - domain
@@ -3378,6 +3491,18 @@ components:
           type: boolean
           description: Whether the proxy cluster has CrowdSec configured
           example: false
+        auto_configured:
+          type: boolean
+          description: Whether NetBird wrote the wildcard CNAME automatically via a stored DNS provider credential. False means the user added the record manually.
+          example: false
+        auto_configured_provider:
+          type: string
+          description: DNS provider type used when auto_configured is true. Denormalized from the credential at write time so it survives credential deletion.
+          example: "cloudflare"
+        auto_configured_credential_id:
+          type: string
+          description: Reference to the stored credential that was used when auto_configured is true. May refer to a credential that has since been deleted.
+          example: "cred_01HXYZ"
       required:
         - id
         - domain
@@ -3394,9 +3519,34 @@ components:
           type: string
           description: The proxy cluster this domain should be validated against
           example: "eu.proxy.netbird.io"
+        auto_configure:
+          $ref: '#/components/schemas/AutoConfigureRequest'
       required:
         - domain
         - target_cluster
+    AutoConfigureRequest:
+      type: object
+      description: |
+        Optional. When present, NetBird uses the referenced DNS provider
+        credential to automatically write the wildcard CNAME for this
+        domain. Omit this field to use the default manual-CNAME flow.
+      properties:
+        credential_id:
+          type: string
+          description: Reference to a stored DNS provider credential
+          example: "cred_01HXYZ"
+        provider:
+          type: string
+          description: DNS provider type. Must match the credential's provider type — the server validates this and rejects mismatches.
+          enum:
+            - cloudflare
+            - route53
+            - digitalocean
+            - rfc2136
+          example: "cloudflare"
+      required:
+        - credential_id
+        - provider
     InstanceStatus:
       type: object
       description: Instance status information
@@ -11742,6 +11892,157 @@ paths:
                 example: { }
         '400':
           "$ref": "#/components/responses/bad_request"
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '404':
+          "$ref": "#/components/responses/not_found"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+  /api/credentials:
+    get:
+      tags: [ Credentials ]
+      summary: List credentials
+      description: Returns metadata for all credentials owned by the calling account. Optionally filtered by provider_type. Secrets are never included in the response.
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      parameters:
+        - in: query
+          name: provider_type
+          required: false
+          schema:
+            type: string
+          description: Filter by provider_type (exact match).
+          example: cloudflare
+      responses:
+        '200':
+          description: A JSON array of Credential metadata records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Credential'
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+    post:
+      tags: [ Credentials ]
+      summary: Create a credential
+      description: Stores a new credential. The plaintext secret is encrypted at rest. The response contains metadata only.
+      operationId: createCredential
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialRequest'
+      responses:
+        '200':
+          description: Credential created. Response contains metadata only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '400':
+          "$ref": "#/components/responses/bad_request"
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+  /api/credentials/{credentialId}:
+    parameters:
+      - in: path
+        name: credentialId
+        required: true
+        schema:
+          type: string
+        description: Credential reference.
+    get:
+      tags: [ Credentials ]
+      summary: Get credential metadata
+      description: Returns metadata for a single credential. Secret is never included.
+      operationId: getCredential
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      responses:
+        '200':
+          description: Credential metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '404':
+          "$ref": "#/components/responses/not_found"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+    put:
+      tags: [ Credentials ]
+      summary: Update (rotate) a credential
+      description: |
+        Overwrites the encrypted secret (and optionally provider type and
+        name) for an existing credential. The ref is stable: services that
+        reference this credential pick up the new secret on their next
+        renewal. Response carries metadata only — the new secret is never
+        echoed back.
+      operationId: updateCredential
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialRequest'
+      responses:
+        '200':
+          description: Credential updated. Response contains metadata only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '400':
+          "$ref": "#/components/responses/bad_request"
+        '401':
+          "$ref": "#/components/responses/requires_authentication"
+        '403':
+          "$ref": "#/components/responses/forbidden"
+        '404':
+          "$ref": "#/components/responses/not_found"
+        '500':
+          "$ref": "#/components/responses/internal_error"
+    delete:
+      tags: [ Credentials ]
+      summary: Delete a credential
+      description: Removes a credential record. Idempotent.
+      operationId: deleteCredential
+      security:
+        - BearerAuth: [ ]
+        - TokenAuth: [ ]
+      responses:
+        '200':
+          description: Credential deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                example: { }
         '401':
           "$ref": "#/components/responses/requires_authentication"
         '403':
